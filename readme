@@ -1,0 +1,216 @@
+
+• 下面按 phaseCompensateMIMO.m:1 的代码流程解释相位补偿原理。
+
+  核心思想
+
+  假设某个扫描位置 (y,x) 上，理想情况下不同 RX 通道看到的是同一个目标回波，只是通道响应和噪声不同。如果硬件运动抖动让第
+  rx 个接收通道多了一个相位误差：
+
+  data(rx,tx,freq下面按 [phaseCompensateMIMO.m](/home/lucas/proj/thz/phaseCompensateMIMO.m:1) 的代码流程解释相位补偿原
+  理。
+
+  **核心思想**
+  假设输入数据是：
+
+  ```matlab
+  data(rx, tx, freq, y, x)
+
+  其中每个扫描位置 (y, x) 上，不同 RX 通道可能因为运动抖动产生额外相位误差。代码的目标是估计：
+
+  phaseEst(rx, y, x)
+
+  然后用反相位把它消掉：
+
+  dataCorr = data .* exp(-1j * phaseEst)
+
+  也就是说，如果某个 RX 通道采到的数据被抖动引入了：
+
+  dataMeasured = dataTrue * exp(1j * phi)
+
+  那么补偿时乘：
+
+  exp(-1j * phi)
+
+  就能得到：
+
+  dataMeasured * exp(-1j * phi) = dataTrue
+
+  1. 统一数据维度
+
+  代码这里先把输入数据整理成标准顺序：
+
+  [dataStd, standardPerm, dimNames] = toStandardOrder(data, opts.dimOrder);
+
+  标准顺序固定为：
+
+  rx, tx, freq, y, x
+
+  这样后续算法不用关心用户原始数据的维度顺序。如果你的数据本来就是：
+
+  data(rx, tx, freq, y, x)
+
+  那么 opts.dimOrder = 'rx_tx_freq_y_x' 即可。
+
+  2. 选择用于估计相位的频点
+
+  freqIdx = opts.freqIdx;
+  if isempty(freqIdx)
+      freqIdx = 1:nFreq;
+  end
+
+  estData = dataStd(:, :, freqIdx, :, :);
+
+  这一步决定哪些频率点参与相位估计。
+
+  如果某些频率点信噪比差，可以只选中间稳定频段，例如：
+
+  opts.freqIdx = 12:84;
+
+  这样估计出来的相位会更稳。
+
+  3. 选参考 RX 通道
+
+  refData = estData(opts.refRx, :, :, :, :);
+  refData = repmat(refData, [nRx 1 1 1 1]);
+
+  这里默认用 refRx = 1 作为参考通道。
+
+  算法只能估计“其他 RX 相对于参考 RX 的相位偏差”，不能知道绝对相位。因此参考通道的相位被定义为 0：
+
+  phaseStd(opts.refRx, :, :) = 0;
+
+  这在相位校正里是正常的，因为整体公共相位通常不影响相干成像。
+
+  4. 通过复数相关估计相位差
+
+  这是最关键的一行：
+
+  corrMap = reshape(sum(sum(estData .* conj(refData), 2), 3), [nRx nY nX]);
+
+  数学上等价于：
+
+  c(rx,y,x) = sum_tx sum_freq data(rx,tx,freq,y,x) ...
+              * conj(data(refRx,tx,freq,y,x))
+
+  解释一下：
+
+  - data(rx,...) 是当前 RX 通道的数据。
+  - conj(data(refRx,...)) 是参考 RX 通道的复共轭。
+  - 两者相乘后，公共的目标相位会尽量抵消。
+  - 剩下的主要是当前 RX 相对于参考 RX 的相位差。
+  - 对 tx 和 freq 求和，是为了提高信噪比。
+
+  如果当前 RX 比参考 RX 多了一个相位误差 phi(rx,y,x)，可以近似理解为：
+
+  data(rx) = signal * exp(1j * phi)
+  data(ref) = signal
+
+  则：
+
+  data(rx) * conj(data(ref))
+  ≈ |signal|^2 * exp(1j * phi)
+
+  所以相关结果的角度就是相位偏差：
+
+  phaseStd = angle(corrMap);
+
+  5. 用相关幅度作为可信度
+
+  weightStd = abs(corrMap);
+  maskStd = buildMagnitudeMask(weightStd, opts.minMagnitudePercentile);
+
+  abs(corrMap) 越大，说明当前 RX 和参考 RX 越相关，相位估计越可信。
+
+  如果某些扫描位置回波很弱，angle(corrMap) 可能主要是噪声。代码用 minMagnitudePercentile 去掉较弱的位置。例如：
+
+  opts.minMagnitudePercentile = 20;
+
+  表示每个 RX 中相关幅度最低的 20% 位置会被降权。
+
+  6. 相位展开和平滑
+
+  phaseStd = smoothPhaseMaps(phaseStd, weightStd, maskStd, opts);
+
+  内部主要做三件事。
+
+  第一，相位展开：
+
+  phaseMap = unwrap(unwrap(phaseMap, [], 1), [], 2);
+
+  因为 angle() 输出范围是 [-pi, pi]，真实相位如果连续变化，可能会出现从 pi 跳到 -pi 的断裂。unwrap 会把这种跳变展开成连
+  续相位。
+
+  第二，可选去掉平均相位：
+
+  phaseMap = phaseMap - sum(phaseMap(:) .* weightMap(:)) / denom;
+
+  如果：
+
+  opts.removeMeanPhase = true;
+
+  代码会去掉每个 RX 的平均相位，只保留随扫描位置变化的相位抖动。
+
+  注意：如果你也想补偿 RX 通道之间的固定相位差，则应设为：
+
+  opts.removeMeanPhase = false;
+
+  demo 里就是这么设的。
+
+  第三，二维平滑：
+
+  numerator = conv2(phaseMap .* weightMap, kernel, 'same');
+  denominator = conv2(weightMap, kernel, 'same');
+  phaseMap = numerator ./ denominator;
+
+  这相当于对相位图做加权移动平均。强信号位置权重大，弱信号位置权重小，可以减少局部噪声造成的相位估计跳变。
+
+  7. 施加相位补偿
+
+  comp = exp(-1i * reshape(phaseStd, [nRx 1 1 nY nX]));
+  dataCorrStd = dataStd .* comp;
+
+  这里构造了一个补偿因子：
+
+  exp(-1j * phaseStd(rx,y,x))
+
+  它只随 RX 和扫描位置变化，不随 TX 和频率变化。因此代码把它 reshape 成：
+
+  [nRx, 1, 1, nY, nX]
+
+  这样 MATLAB 会把它广播到所有 TX 和频率点。
+
+  补偿后：
+
+  dataCorrStd(rx,tx,freq,y,x)
+  = dataStd(rx,tx,freq,y,x) * exp(-1j * phaseStd(rx,y,x))
+
+  8. 输出诊断信息
+
+  info.coherenceBefore = channelCoherence(dataStd, opts.refRx, freqIdx);
+  info.coherenceAfter = channelCoherence(dataCorrStd, opts.refRx, freqIdx);
+
+  这部分计算补偿前后每个 RX 与参考 RX 的相干性。
+
+  如果算法有效，通常会看到：
+
+  info.coherenceAfter > info.coherenceBefore
+
+  也就是补偿后各 RX 通道更相干，成像时叠加效果更好。
+
+  这段代码适合的误差模型
+  当前实现假设相位误差主要是：
+
+  phi(rx, y, x)
+
+  也就是：
+
+  - 和 RX 通道有关；
+  - 和扫描位置有关；
+  - 近似不随频率变化；
+  - 对同一个 RX、同一个扫描位置下的所有 TX/freq 使用同一个补偿相位。
+
+  如果真实硬件抖动表现为路径长度变化，那么相位误差可能是：
+
+  phi(freq, y, x) = 4*pi*f*deltaR(y,x)/c
+
+  这种情况下相位会随频率线性变化，当前代码只能作为近似补偿，需要扩展为“频率相关相位补偿”或“位移误差估计”。
